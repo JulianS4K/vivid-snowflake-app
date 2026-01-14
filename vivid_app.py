@@ -1,152 +1,133 @@
-import streamlit as st
+import os
 import requests
-import pandas as pd
+import csv
 import xml.etree.ElementTree as ET
-import snowflake.connector
+import tkinter as tk
+from tkinter import messagebox, ttk, filedialog
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
-st.set_page_config(layout="wide", page_title="Vivid Seats Manager")
-st.title("🎫 Vivid Seats to Snowflake (Cloud)")
+# Load API Token from .env file
+load_dotenv()
 
-# --- CREDENTIALS HANDLING ---
-# This checks if you have saved your passwords in Streamlit Secrets.
-# If yes, it uses them. If no, it asks you to type them in.
-secrets = st.secrets.get("snowflake", {})
-vivid_secret = st.secrets.get("vivid", {})
+class VividSeatsDownloader:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Vivid Seats Pro Order Porter")
+        self.root.geometry("480x400")
+        self.root.configure(padx=20, pady=20)
 
-with st.sidebar:
-    st.header("1. Snowflake Login")
-    
-    if "user" in secrets:
-        st.success("✅ Credentials loaded from Secrets")
-        sf_user = secrets["user"]
-        sf_pass = secrets["password"]
-        sf_account = secrets["account"]
-    else:
-        sf_user = st.text_input("Username")
-        sf_pass = st.text_input("Password", type="password")
-        sf_account = st.text_input("Account ID (e.g., xy12345.us-east-1)")
-    
-    st.divider()
-    
-    st.header("2. Vivid Seats")
-    if "token" in vivid_secret:
-        st.success("✅ Vivid Token loaded")
-        vivid_token = vivid_secret["token"]
-    else:
-        vivid_token = st.text_input("Vivid API Token", type="password")
-    
-    test_mode = st.checkbox("🛠 Enable Test Mode", value=False)
+        # --- UI Setup ---
+        tk.Label(root, text="Vivid Seats API Token", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.token_entry = tk.Entry(root, width=50)
+        self.token_entry.pack(pady=(0, 15), fill="x")
+        
+        # Load default from .env
+        env_token = os.getenv("VIVID_API_TOKEN")
+        if env_token:
+            self.token_entry.insert(0, env_token)
 
-# --- FUNCTIONS ---
-def parse_vivid_xml(xml_string):
-    try:
-        root = ET.fromstring(xml_string)
-        orders_data = []
-        for order in root.findall('order'):
-            def get_val(tag):
-                node = order.find(tag)
-                return node.text.strip() if node is not None and node.text else None
+        tk.Label(root, text="Order Status to Fetch", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.status_var = tk.StringVar(value="PENDING_SHIPMENT")
+        statuses = ["UNCONFIRMED", "PENDING_SHIPMENT", "COMPLETED", "VERIFICATION", "PENDING_RESERVATION"]
+        self.status_combo = ttk.Combobox(root, textvariable=self.status_var, values=statuses, state="readonly")
+        self.status_combo.pack(pady=(0, 20), fill="x")
 
-            orders_data.append({
-                "ORDER_ID": get_val('orderId'),
-                "STATUS": get_val('status'),
-                "COST": get_val('cost'),
-                "EVENT_NAME": get_val('event'),
-                "EVENT_DATE": get_val('eventDate'),
-                "QUANTITY": get_val('quantity'),
-                "SECTION": get_val('section'),
-                "ROW_NAME": get_val('row'),
-                "VENUE": get_val('venue'),
-                "FIRST_NAME": get_val('firstName'),
-                "LAST_NAME": get_val('lastName'),
-                "EMAIL_ADDRESS": get_val('emailAddress')
-            })
-        return pd.DataFrame(orders_data)
-    except Exception as e:
-        st.error(f"Error parsing XML: {e}")
-        return pd.DataFrame()
-
-def upload_to_snowflake(df, user, password, account):
-    try:
-        conn = snowflake.connector.connect(
-            user=user,
-            password=password,
-            account=account,
-            warehouse='COMPUTE_WH',
-            database='VIVID_SEATS_DB',
-            schema='RAW_DATA'
+        self.btn_fetch = tk.Button(
+            root, text="DOWNLOAD & SAVE CSV", 
+            command=self.run_process, 
+            bg="#2c3e50", fg="white", font=("Arial", 10, "bold"), pady=10
         )
-        cur = conn.cursor()
-        
-        success_count = 0
-        progress_bar = st.progress(0)
-        
-        for index, row in df.iterrows():
-            sql = f"""
-            INSERT INTO ORDERS_Flat 
-            (ORDER_ID, STATUS, COST, EVENT_NAME, EVENT_DATE, QUANTITY, SECTION, ROW_NAME, VENUE, FIRST_NAME, LAST_NAME, EMAIL_ADDRESS)
-            VALUES 
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            cur.execute(sql, (
-                row['ORDER_ID'], row['STATUS'], row['COST'], row['EVENT_NAME'], 
-                row['EVENT_DATE'], row['QUANTITY'], row['SECTION'], row['ROW_NAME'], 
-                row['VENUE'], row['FIRST_NAME'], row['LAST_NAME'], row['EMAIL_ADDRESS']
-            ))
-            success_count += 1
-            progress_bar.progress((index + 1) / len(df))
-            
-        conn.commit()
-        cur.close()
-        conn.close()
-        return success_count
-    except Exception as e:
-        st.error(f"Snowflake Connection Failed: {e}")
-        return 0
+        self.btn_fetch.pack(fill="x")
 
-# --- MAIN APP ---
-col1, col2 = st.columns(2)
-with col1:
-    target_status = st.selectbox("Order Status", ["PENDING_SHIPMENT", "UNCONFIRMED", "COMPLETED"])
+        self.log_label = tk.Label(root, text="Ready to fetch", fg="gray", pady=10)
+        self.log_label.pack()
 
-if st.button("🚀 Fetch Orders"):
-    if test_mode:
-        st.warning("⚠️ Using Fake Data")
-        fake_xml = """<orders><order><orderId>12345678</orderId><status>PENDING_SHIPMENT</status><cost>150.00</cost><event>Test Event</event><eventDate>2026-05-20</eventDate><quantity>2</quantity><section>100</section><row>A</row><venue>SoFi</venue><firstName>John</firstName><lastName>Doe</lastName><emailAddress>test@example.com</emailAddress></order></orders>"""
-        df = parse_vivid_xml(fake_xml)
-        st.session_state['df'] = df
-        st.success("Loaded Test Data")
-    elif not vivid_token:
-        st.warning("Please enter Vivid Token")
-    else:
+    def run_process(self):
+        token = self.token_entry.get().strip()
+        status = self.status_var.get()
+
+        if not token:
+            messagebox.showwarning("Missing Token", "Please enter your API token.")
+            return
+
+        self.log_label.config(text="Contacting Vivid Seats...", fg="blue")
+        self.root.update_idletasks()
+
+        url = "https://brokers.vividseats.com/webservices/v1/getOrders"
+        params = {"apiToken": token, "status": status}
+        headers = {"Accept": "application/xml"}
+
         try:
-            url = "https://brokers.vividseats.com/webservices/v1/getOrders"
-            params = {'apiToken': vivid_token, 'status': target_status}
-            with st.spinner("Calling API..."):
-                response = requests.get(url, params=params)
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            
             if response.status_code == 200:
-                df = parse_vivid_xml(response.text)
-                if not df.empty:
-                    st.session_state['df'] = df
-                    st.success(f"Found {len(df)} orders!")
-                else:
-                    st.warning("No orders found.")
+                self.parse_and_save(response.content)
             elif response.status_code == 429:
-                st.error("⛔ Rate Limit Hit. Wait 60 seconds.")
+                messagebox.showerror("Rate Limit", "Too many requests. Please wait 60 seconds for PENDING_SHIPMENT.")
             else:
-                st.error(f"API Error: {response.status_code}")
+                messagebox.showerror("API Error", f"HTTP {response.status_code}\nCheck your token or connection.")
         except Exception as e:
-            st.error(f"Connection Error: {e}")
+            messagebox.showerror("Error", str(e))
+        
+        self.log_label.config(text="Ready", fg="gray")
 
-if 'df' in st.session_state:
-    st.dataframe(st.session_state['df'], use_container_width=True)
-    if st.button("❄️ Upload to Snowflake"):
-        if not sf_user or not sf_pass:
-            st.error("Missing Snowflake Credentials")
-        else:
-            with st.spinner("Uploading..."):
-                count = upload_to_snowflake(st.session_state['df'], sf_user, sf_pass, sf_account)
-                if count > 0:
-                    st.balloons()
-                    st.success("Success!")
+    def parse_and_save(self, xml_data):
+        try:
+            root = ET.fromstring(xml_data)
+            orders_list = root.findall("order")
+
+            if not orders_list:
+                messagebox.showinfo("No Data", "No orders were found for this status.")
+                return
+
+            # 1. Identify all possible columns (Dynamic Header Detection)
+            # This ensures that if some orders have 'firstName' and others don't, 
+            # the CSV will still have the 'firstName' column.
+            all_fields = set()
+            parsed_orders = []
+
+            for order in orders_list:
+                order_data = {}
+                for child in order:
+                    tag = child.tag
+                    # Flatten the seats array
+                    if tag == 'seats':
+                        seat_values = [s.text.strip() for s in child.findall('seat') if s.text]
+                        val = ", ".join(seat_values)
+                    else:
+                        val = child.text.strip() if child.text else ""
+                    
+                    order_data[tag] = val
+                    all_fields.add(tag)
+                parsed_orders.append(order_data)
+
+            # Sort headers so they appear consistently (optional)
+            headers = sorted(list(all_fields))
+
+            # 2. Save Dialog
+            save_path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV Files", "*.csv")],
+                title="Save Report As"
+            )
+
+            if not save_path:
+                return
+
+            # 3. Write CSV
+            with open(save_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(parsed_orders)
+
+            messagebox.showinfo("Success", f"Successfully saved {len(parsed_orders)} orders to CSV.")
+
+        except ET.ParseError:
+            messagebox.showerror("Parse Error", "The server returned invalid XML data.")
+        except Exception as e:
+            messagebox.showerror("File Error", f"Failed to save file: {e}")
+
+if __name__ == "__main__":
+    main_root = tk.Tk()
+    app = VividSeatsDownloader(main_root)
+    main_root.mainloop()
